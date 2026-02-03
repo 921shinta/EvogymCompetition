@@ -1,15 +1,16 @@
-# server/trainer/run_experiment.py
 from __future__ import annotations
 import os, sys, shutil, argparse, math, random
 from typing import List
 import numpy as np
-from evogym import sample_robot, hashable
+from evogym import sample_robot, hashable, get_full_connectivity
 
 from server.trainer.utils.mp_group import Group
 from server.trainer.ga.base import Individual
-from server.trainer.ga.engine import resolve_env, copy_active_assets           # ← evaluate_structure を消す
-from server.trainer.ga.evaluator import evaluate_structure                     # ← ここからインポート
+from server.trainer.ga.engine import resolve_env, copy_active_assets
+from server.trainer.ga.evaluator import evaluate_structure
 from server.trainer.ga.registry import get_mutation, get_crossover, get_selection
+from server.trainer.ga.operators.crossovers import SinglePointCrossover, NoCrossover
+from server.trainer.ga.operators.mutations import RotationMutation, DefaultMutation
 
 
 def save_generation(home_path: str, generation: int, structures: List[Individual]) -> None:
@@ -18,10 +19,14 @@ def save_generation(home_path: str, generation: int, structures: List[Individual
     os.makedirs(struct_dir, exist_ok=True)
     with open(os.path.join(gen_dir, "output.txt"), "w") as fout:
         for s in structures:
+            conn = s.connections
+            if conn is None:
+                conn = get_full_connectivity(s.body)
+
             np.savez(
                 os.path.join(struct_dir, f"{s.label}.npz"),
                 s.body,
-                s.connections,
+                conn,
                 np.array(s.controller_params, dtype=np.float32),
             )
             f_str = ",".join(f"{v:.4f}" for v in s.controller_params)
@@ -38,7 +43,9 @@ def run_experiment(
     max_steps: int,
     max_episode_steps: int | None = None,
     mutation_name: str = "default",
+    mutation_rate: float = 0.1,
     crossover_name: str = "none",
+    crossover_rate: float = 0.5,
     selection_name: str = "truncation",
     use_custom_env: bool = True,
 ) -> None:
@@ -50,7 +57,6 @@ def run_experiment(
     if is_custom:
         copy_active_assets(home_path, env_id)
 
-    # 実験メタデータを保存（ベース/カスタム共通で ENV 名を記録）
     metadata_path = os.path.join(home_path, "metadata.txt")
     with open(metadata_path, "w") as f:
         f.write("ALGO: GA\n")
@@ -62,21 +68,28 @@ def run_experiment(
         if max_episode_steps is not None:
             f.write(f"MAX_EPISODE_STEPS: {max_episode_steps}\n")
         try:
-            import evogym, gymnasium, numpy as _np  # type: ignore
-
-            f.write(
-                f"VERSIONS: evogym={getattr(evogym, '__version__', 'unknown')}, "
-                f"gymnasium={getattr(gymnasium, '__version__', 'unknown')}, "
-                f"numpy={_np.__version__}\n"
-            )
-        except Exception:
+            import evogym, gymnasium, numpy as _np
+            f.write(f"VERSIONS: evogym={getattr(evogym, '__version__', 'unknown')}\n")
+        except:
             pass
 
-    mutation = get_mutation(mutation_name)
-    crossover = get_crossover(crossover_name)
+    if mutation_name == "default" or mutation_name == "rotation":
+        base_mutation_func = DefaultMutation()
+    else:
+        base_mutation_func = get_mutation(mutation_name)
+    
+    rotation_op = RotationMutation()
+    use_rotation = (mutation_name == "rotation")
+
+    if crossover_name == "single_point":
+        crossover = SinglePointCrossover()
+    elif crossover_name == "none":
+        crossover = NoCrossover()
+    else:
+        crossover = get_crossover(crossover_name)
+        
     selection = get_selection(selection_name)
 
-    # 初期集団
     structures: List[Individual] = []
     seen_hashes = set()
     num_evals, gen = 0, 0
@@ -88,7 +101,6 @@ def run_experiment(
         seen_hashes.add(hashable(body))
         num_evals += 1
 
-    # 進化ループ
     while num_evals <= max_evaluations:
         print(f"Generation {gen} | evals {num_evals}/{max_evaluations}")
         group = Group()
@@ -111,24 +123,38 @@ def run_experiment(
         next_label = len(survivors)
 
         while len(children) < lam and num_evals < max_evaluations:
-            if random.random() < 0.5:
+            # 1. 交叉 (Crossover)
+            if random.random() < crossover_rate:
                 p1, p2 = random.sample(survivors, 2)
                 c1, c2 = crossover(p1, p2)
                 for child in (c1, c2):
-                    if len(children) >= lam or num_evals >= max_evaluations:
-                        break
+                    if len(children) >= lam or num_evals >= max_evaluations: break
+                    
+                    # 【追加修正】ここで重複チェックを行う！
+                    # 親のコピー（クローン）だったり、既出の形状ならスキップする
+                    if hashable(child.body) in seen_hashes:
+                        continue
+
                     child.label = next_label
                     children.append(child)
                     seen_hashes.add(hashable(child.body))
                     next_label += 1
                     num_evals += 1
+            
+            # 2. 突然変異 (Mutation)
             else:
                 parent = random.choice(survivors)
-                child = mutation(parent, next_label)
-                if child is None:
-                    continue
-                if hashable(child.body) in seen_hashes:
-                    continue
+                child = None
+                
+                if use_rotation and random.random() < mutation_rate:
+                    child = rotation_op(parent, next_label)
+                else:
+                    child = base_mutation_func(parent, next_label)
+                
+                if child is None: continue
+                # 突然変異はもともと重複チェックがある
+                if hashable(child.body) in seen_hashes: continue
+                
                 children.append(child)
                 seen_hashes.add(hashable(child.body))
                 next_label += 1
@@ -146,19 +172,17 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="Walker-v0")
     parser.add_argument("--pop_size", type=int, default=120)
     parser.add_argument("--structure_shape", type=int, nargs=2, default=[5, 5])
-    parser.add_argument("--max_evaluations", type=int, default=1200)
+    parser.add_argument("--max_evaluations", type=int, default=600)
     parser.add_argument("--num_cores", type=int, default=12)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_episode_steps", type=int, default=None)
-    parser.add_argument("--mutation", type=str, default="default")
-    parser.add_argument("--crossover", type=str, default="none")
+    parser.add_argument("--mutation", type=str, default="default", help="Choices: default, rotation")
+    parser.add_argument("--mutation_rate", type=float, default=0.1, help="Probability of rotation")
+    parser.add_argument("--crossover", type=str, default="none", help="Choices: none, single_point")
+    parser.add_argument("--crossover_rate", type=float, default=0.5)
     parser.add_argument("--selection", type=str, default="truncation")
-    parser.add_argument(
-        "--custom_env",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="カスタム環境を使う（デフォルト True）。ベース環境に戻す場合は --no-custom_env。",
-    )
+    parser.add_argument("--custom_env", action=argparse.BooleanOptionalAction, default=True)
+    
     args = parser.parse_args()
 
     run_experiment(
@@ -171,7 +195,9 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         max_episode_steps=args.max_episode_steps,
         mutation_name=args.mutation,
+        mutation_rate=args.mutation_rate,
         crossover_name=args.crossover,
+        crossover_rate=args.crossover_rate,
         selection_name=args.selection,
         use_custom_env=args.custom_env,
     )
