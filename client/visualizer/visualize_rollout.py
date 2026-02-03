@@ -13,6 +13,8 @@ from typing import Optional
 
 # === project root を sys.path に通す（学習側と同じ） ===
 import importlib
+import importlib.util
+import types
 PROJECT_ROOT = os.path.abspath("./")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -35,6 +37,43 @@ def _register_custom_env():
         except Exception:
             continue
     return None
+
+def _load_snapshot_custom_env(snapshot_dir: str):
+    """code_snapshot/custom_env から env_core/register を直接ロードして使う。"""
+    env_core_path = os.path.join(snapshot_dir, "env_core.py")
+    register_path = os.path.join(snapshot_dir, "register.py")
+    if not (os.path.isfile(env_core_path) and os.path.isfile(register_path)):
+        return None, None
+
+    # server / server.custom_env のダミーパッケージを用意
+    if "server" not in sys.modules:
+        server_pkg = types.ModuleType("server")
+        server_pkg.__path__ = []
+        sys.modules["server"] = server_pkg
+    if "server.custom_env" not in sys.modules:
+        custom_pkg = types.ModuleType("server.custom_env")
+        custom_pkg.__path__ = [snapshot_dir]
+        sys.modules["server.custom_env"] = custom_pkg
+
+    # env_core を snapshot からロード
+    core_name = "server.custom_env.env_core"
+    core_spec = importlib.util.spec_from_file_location(core_name, env_core_path)
+    if core_spec is None or core_spec.loader is None:
+        return None, None
+    core_mod = importlib.util.module_from_spec(core_spec)
+    sys.modules[core_name] = core_mod
+    core_spec.loader.exec_module(core_mod)
+
+    # register を snapshot からロード（entry_point は server.custom_env.env_core を参照）
+    reg_name = "server.custom_env.register"
+    reg_spec = importlib.util.spec_from_file_location(reg_name, register_path)
+    if reg_spec is None or reg_spec.loader is None:
+        return None, None
+    reg_mod = importlib.util.module_from_spec(reg_spec)
+    sys.modules[reg_name] = reg_mod
+    reg_spec.loader.exec_module(reg_mod)
+
+    return core_mod, reg_mod
 
 # ── metadata と JSON で環境を用意する ─────────────────────────
 def _read_metadata_env(exp_dir: str) -> Optional[str]:
@@ -92,18 +131,15 @@ def _ensure_env_from_bundle(exp_dir: str, cli_env_fallback: Optional[str]) -> st
     if bundled_json is not None:
         os.environ[ACTIVE_JSON_ENVVAR] = bundled_json
 
-    snap_root = os.path.join(exp_dir, "code_snapshot")
-    if os.path.isdir(snap_root) and snap_root not in sys.path:
-        sys.path.insert(0, snap_root)
-        importlib.invalidate_caches()
-
-    # snapshot 側の custom_env を import
-    mod_name = _register_custom_env()
-    if mod_name is None:
-        raise ImportError("custom_env パッケージが import できません。")
-
-    core = importlib.import_module(f"{mod_name}.env_core")
-    reg  = importlib.import_module(f"{mod_name}.register")
+    snap_custom = os.path.join(exp_dir, "code_snapshot", "custom_env")
+    core, reg = _load_snapshot_custom_env(snap_custom)
+    if core is None or reg is None:
+        # snapshot が無い／不完全なら既存の custom_env を使う
+        mod_name = _register_custom_env()
+        if mod_name is None:
+            raise ImportError("custom_env パッケージが import できません。")
+        core = importlib.import_module(f"{mod_name}.env_core")
+        reg = importlib.import_module(f"{mod_name}.register")
 
     # 実験同梱 JSON を使用（存在する場合だけ）
     if bundled_json is not None:

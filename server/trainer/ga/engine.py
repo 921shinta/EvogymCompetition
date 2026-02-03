@@ -114,4 +114,18 @@ def copy_active_assets(home_path: str, env_id: Optional[str] = None) -> None:
     shutil.copy2(world_json, os.path.join(dst_dir, os.path.basename(world_json)))
 
 
-__all__ = ["resolve_env", "copy_active_assets"]
+def copy_custom_env_snapshot(home_path: str) -> None:
+    """
+    custom_env の実装スナップショットを保存する。
+    - 保存先: <home_path>/code_snapshot/custom_env/
+    - 対象: env_core.py, register.py
+    """
+    snap_dir = os.path.join(home_path, "code_snapshot", "custom_env")
+    os.makedirs(snap_dir, exist_ok=True)
+    for fname in ("env_core.py", "register.py"):
+        src = os.path.join("server", "custom_env", fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(snap_dir, fname))
+
+
+__all__ = ["resolve_env", "copy_active_assets", "copy_custom_env_snapshot"]

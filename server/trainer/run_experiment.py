@@ -7,7 +7,11 @@ from evogym import sample_robot, hashable
 
 from server.trainer.utils.mp_group import Group
 from server.trainer.ga.base import Individual
-from server.trainer.ga.engine import resolve_env, copy_active_assets           # ← evaluate_structure を消す
+from server.trainer.ga.engine import (
+    resolve_env,
+    copy_active_assets,
+    copy_custom_env_snapshot,
+)
 from server.trainer.ga.evaluator import evaluate_structure                     # ← ここからインポート
 from server.trainer.ga.registry import get_mutation, get_crossover, get_selection
 
@@ -49,6 +53,7 @@ def run_experiment(
     os.makedirs(home_path, exist_ok=True)
     if is_custom:
         copy_active_assets(home_path, env_id)
+        copy_custom_env_snapshot(home_path)
 
     # 実験メタデータを保存（ベース/カスタム共通で ENV 名を記録）
     metadata_path = os.path.join(home_path, "metadata.txt")
@@ -156,7 +161,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--custom_env",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="カスタム環境を使う（デフォルト True）。ベース環境に戻す場合は --no-custom_env。",
     )
     args = parser.parse_args()
